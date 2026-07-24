@@ -1,4 +1,4 @@
-const API_URL = "http://localhost:5000/api/forms";
+const API_URL = "http://35.234.221.31:5000/api/forms";
 
 const contactForm = document.getElementById("contactForm");
 const nameInput = document.getElementById("name");

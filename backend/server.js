@@ -18,7 +18,8 @@ app.use(
   cors({
     origin: [
       "http://localhost:5500",
-      "http://127.0.0.1:5500"
+      "http://127.0.0.1:5500",
+      "http://8.231.124.167"
     ],
     methods: ["GET", "POST", "DELETE"],
     allowedHeaders: ["Content-Type"]
@@ -35,33 +36,6 @@ app.get("/", (req, res) => {
   });
 });
 
-app.get("/health", (req, res) => {
-  res.status(200).json({
-    success: true,
-    status: "healthy"
-  });
-});
-
 app.use("/api/forms", formRoutes);
 
-app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    message: "API route nahi mila"
-  });
-});
-
-app.use((error, req, res, next) => {
-  console.error("Server error:", error);
-
-  res.status(500).json({
-    success: false,
-    message: "Internal server error"
-  });
-});
-
-const PORT = process.env.PORT || 5000;
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server port ${PORT} par running hai`);
-});
+// Rest of your code (PORT, app.listen, etc.) remains exactly the same.

@@ -1,16 +1,16 @@
-name: Deploy Development
+name: Deploy Production
 
 on:
   push:
     branches:
-      - dev
+      - main
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: development-deployment
+  group: production-deployment
   cancel-in-progress: false
 
 jobs:
@@ -37,20 +37,20 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Check syntax
+      - name: Check backend syntax
         run: node --check server.js
 
-      - name: Run tests
+      - name: Run backend tests
         run: npm test --if-present
 
   deploy:
-    name: Deploy to Development
+    name: Deploy to Production
     needs: test
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     environment:
-      name: development
+      name: production
 
     env:
       SSH_USER: ${{ secrets.SSH_USER }}
@@ -79,7 +79,7 @@ jobs:
 
           for variable_name in "${required_variables[@]}"; do
             if [[ -z "${!variable_name:-}" ]]; then
-              echo "::error::Required secret or variable is missing: ${variable_name}"
+              echo "::error::Missing required secret: ${variable_name}"
               exit 1
             fi
           done
@@ -94,21 +94,27 @@ jobs:
           mkdir -p "${HOME}/.ssh"
           chmod 700 "${HOME}/.ssh"
 
-          printf '%s\n' "${SSH_PRIVATE_KEY}" > "${HOME}/.ssh/deploy_key"
+          printf '%s\n' "${SSH_PRIVATE_KEY}" \
+            > "${HOME}/.ssh/deploy_key"
+
           chmod 600 "${HOME}/.ssh/deploy_key"
 
           touch "${HOME}/.ssh/known_hosts"
           chmod 600 "${HOME}/.ssh/known_hosts"
 
-          ssh-keyscan -T 10 -H "${BACKEND_HOST}" \
+          ssh-keyscan \
+            -T 10 \
+            -H "${BACKEND_HOST}" \
             >> "${HOME}/.ssh/known_hosts"
 
           if [[ "${FRONTEND_HOST}" != "${BACKEND_HOST}" ]]; then
-            ssh-keyscan -T 10 -H "${FRONTEND_HOST}" \
+            ssh-keyscan \
+              -T 10 \
+              -H "${FRONTEND_HOST}" \
               >> "${HOME}/.ssh/known_hosts"
           fi
 
-      - name: Verify SSH connections
+      - name: Verify backend SSH connection
         shell: bash
         run: |
           set -euo pipefail
@@ -119,6 +125,11 @@ jobs:
             -o ConnectTimeout=10 \
             "${SSH_USER}@${BACKEND_HOST}" \
             "echo 'Backend SSH connection successful'"
+
+      - name: Verify frontend SSH connection
+        shell: bash
+        run: |
+          set -euo pipefail
 
           ssh \
             -i "${HOME}/.ssh/deploy_key" \
@@ -135,7 +146,7 @@ jobs:
           set -euo pipefail
 
           cat > backend/.env <<EOF
-          NODE_ENV=development
+          NODE_ENV=production
           PORT=5000
           MONGODB_URI=${MONGODB_URI}
           ALLOWED_ORIGINS=http://${FRONTEND_HOST}
@@ -150,9 +161,10 @@ jobs:
 
           API_URL="http://${BACKEND_HOST}:5000/api/forms"
 
-          if ! grep -qE '^[[:space:]]*const API_URL[[:space:]]*=' \
+          if ! grep -qE \
+            '^[[:space:]]*const API_URL[[:space:]]*=' \
             frontend/script.js; then
-            echo "::error::Could not find 'const API_URL =' in frontend/script.js"
+            echo "::error::Could not find const API_URL in frontend/script.js"
             exit 1
           fi
 
@@ -160,7 +172,10 @@ jobs:
             "s|^[[:space:]]*const API_URL[[:space:]]*=.*|const API_URL = \"${API_URL}\";|" \
             frontend/script.js
 
-          grep 'const API_URL' frontend/script.js
+          echo "Configured frontend API URL:"
+          grep -E \
+            '^[[:space:]]*const API_URL[[:space:]]*=' \
+            frontend/script.js
 
       - name: Prepare backend directory
         shell: bash
@@ -174,12 +189,14 @@ jobs:
             "${SSH_USER}@${BACKEND_HOST}" \
             "mkdir -p /opt/form-backend"
 
-      - name: Deploy backend
+      - name: Deploy backend files
         shell: bash
         run: |
           set -euo pipefail
 
-          rsync -az \
+          rsync \
+            --archive \
+            --compress \
             --delete \
             --exclude='node_modules/' \
             --exclude='.git/' \
@@ -245,7 +262,7 @@ jobs:
             'bash -se' <<'EOF'
           set -u
 
-          HEALTH_URL="http://127.0.0.1:5000/api/forms"
+          HEALTH_URL="http://127.0.0.1:5000/health"
 
           for attempt in {1..12}; do
             echo "Backend health-check attempt ${attempt}/12"
@@ -257,31 +274,37 @@ jobs:
               --max-time 10 \
               "${HEALTH_URL}" \
               >/dev/null; then
-              echo "Development backend is healthy"
+              echo "Production backend is healthy"
               exit 0
             fi
 
+            echo "Waiting for backend..."
             sleep 5
           done
 
-          echo "Development backend health check failed"
+          echo
+          echo "Production backend health check failed"
+
           echo
           echo "PM2 status:"
           pm2 status form-backend || true
 
           echo
-          echo "Recent backend logs:"
+          echo "Recent PM2 logs:"
           pm2 logs form-backend \
             --lines 100 \
             --nostream \
             || true
 
           echo
-          echo "Listening processes on port 5000:"
+          echo "Port 5000 status:"
+
           if command -v ss >/dev/null 2>&1; then
             ss -lntp | grep ':5000' || true
           elif command -v netstat >/dev/null 2>&1; then
             netstat -lntp | grep ':5000' || true
+          else
+            echo "Neither ss nor netstat is available"
           fi
 
           exit 1
@@ -299,12 +322,14 @@ jobs:
             "${SSH_USER}@${FRONTEND_HOST}" \
             "mkdir -p /var/www/html"
 
-      - name: Deploy frontend
+      - name: Deploy frontend files
         shell: bash
         run: |
           set -euo pipefail
 
-          rsync -az \
+          rsync \
+            --archive \
+            --compress \
             --delete \
             --exclude='.git/' \
             -e "ssh -i ${HOME}/.ssh/deploy_key -o BatchMode=yes -o ConnectTimeout=10" \
@@ -329,12 +354,13 @@ jobs:
               --max-time 10 \
               "${FRONTEND_URL}" \
               >/dev/null; then
-              echo "Development frontend is healthy"
+              echo "Production frontend is healthy"
               exit 0
             fi
 
+            echo "Waiting for frontend..."
             sleep 5
           done
 
-          echo "Development frontend health check failed"
+          echo "Production frontend health check failed"
           exit 1

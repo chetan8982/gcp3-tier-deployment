@@ -1,15 +1,16 @@
-name: Deploy Development
+name: Deploy Production
+
 on:
   push:
     branches:
-      - dev
+      - main
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: development-deployment
+  group: production-deployment
   cancel-in-progress: false
 
 jobs:
@@ -36,20 +37,20 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Check syntax
+      - name: Check backend syntax
         run: node --check server.js
 
-      - name: Run tests
+      - name: Run backend tests
         run: npm test --if-present
 
   deploy:
-    name: Deploy to Development
+    name: Deploy to Production
     needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     environment:
-      name: development
+      name: production
 
     env:
       SSH_USER: ${{ secrets.SSH_USER }}
@@ -60,7 +61,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Validate secrets
+      - name: Validate deployment secrets
         shell: bash
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
@@ -83,6 +84,8 @@ jobs:
             fi
           done
 
+          echo "All required secrets are configured"
+
       - name: Configure SSH
         shell: bash
         env:
@@ -93,7 +96,9 @@ jobs:
           mkdir -p "${HOME}/.ssh"
           chmod 700 "${HOME}/.ssh"
 
-          printf '%s\n' "${SSH_PRIVATE_KEY}" > "${HOME}/.ssh/deploy_key"
+          printf '%s\n' "${SSH_PRIVATE_KEY}" \
+            > "${HOME}/.ssh/deploy_key"
+
           chmod 600 "${HOME}/.ssh/deploy_key"
 
           touch "${HOME}/.ssh/known_hosts"
@@ -111,7 +116,7 @@ jobs:
               >> "${HOME}/.ssh/known_hosts"
           fi
 
-      - name: Verify backend SSH
+      - name: Verify backend SSH connection
         shell: bash
         run: |
           set -euo pipefail
@@ -123,7 +128,7 @@ jobs:
             "${SSH_USER}@${BACKEND_HOST}" \
             "echo 'Backend SSH connection successful'"
 
-      - name: Verify frontend SSH
+      - name: Verify frontend SSH connection
         shell: bash
         run: |
           set -euo pipefail
@@ -143,10 +148,10 @@ jobs:
           set -euo pipefail
 
           {
-            echo "NODE_ENV=development"
+            echo "NODE_ENV=production"
             echo "PORT=5000"
             printf 'MONGODB_URI=%s\n' "${MONGODB_URI}"
-            echo "ALLOWED_ORIGINS=http://${FRONTEND_HOST}"
+            printf 'ALLOWED_ORIGINS=http://%s\n' "${FRONTEND_HOST}"
           } > backend/.env
 
           chmod 600 backend/.env
@@ -169,6 +174,7 @@ jobs:
             "s|^[[:space:]]*const API_URL[[:space:]]*=.*|const API_URL = \"${API_URL}\";|" \
             frontend/script.js
 
+          echo "Configured frontend API URL:"
           grep -E \
             '^[[:space:]]*const API_URL[[:space:]]*=' \
             frontend/script.js
@@ -185,7 +191,7 @@ jobs:
             "${SSH_USER}@${BACKEND_HOST}" \
             "mkdir -p /opt/form-backend"
 
-      - name: Deploy backend
+      - name: Deploy backend files
         shell: bash
         run: |
           set -euo pipefail
@@ -215,6 +221,37 @@ jobs:
 
           cd /opt/form-backend
 
+          if ! command -v node >/dev/null 2>&1; then
+            echo "Node.js is not installed"
+            exit 1
+          fi
+
+          if ! command -v npm >/dev/null 2>&1; then
+            echo "npm is not installed"
+            exit 1
+          fi
+
+          if ! command -v pm2 >/dev/null 2>&1; then
+            echo "PM2 is not installed"
+            echo "Install with: sudo npm install --global pm2"
+            exit 1
+          fi
+
+          if [[ ! -f package.json ]]; then
+            echo "package.json not found"
+            exit 1
+          fi
+
+          if [[ ! -f server.js ]]; then
+            echo "server.js not found"
+            exit 1
+          fi
+
+          if [[ ! -f .env ]]; then
+            echo ".env file not found"
+            exit 1
+          fi
+
           echo "Node version:"
           node --version
 
@@ -222,18 +259,12 @@ jobs:
           npm --version
 
           echo "Installing production dependencies..."
-          rm -rf node_modules
           npm ci --omit=dev
 
-          echo "Verifying required modules..."
-          node -e "
-            require('express');
-            require('mongoose');
-            require('cors');
-            require('dotenv');
-            console.log('Backend dependencies are installed');
-          "
+          echo "Checking backend syntax..."
+          node --check server.js
 
+          echo "Restarting backend..."
           pm2 delete form-backend >/dev/null 2>&1 || true
 
           pm2 start server.js \
@@ -241,11 +272,18 @@ jobs:
             --cwd /opt/form-backend \
             --time
 
-          pm2 save
-
           sleep 5
 
-          pm2 status form-backend
+          echo "PM2 status:"
+          pm2 describe form-backend || true
+
+          echo "PM2 logs:"
+          pm2 logs form-backend \
+            --lines 100 \
+            --nostream \
+            || true
+
+          pm2 save
           EOF
 
       - name: Backend health check
@@ -258,7 +296,9 @@ jobs:
             -o BatchMode=yes \
             -o ConnectTimeout=10 \
             "${SSH_USER}@${BACKEND_HOST}" \
-            'bash -s' <<'EOF'
+            'bash -se' <<'EOF'
+          set -u
+
           HEALTH_URL="http://127.0.0.1:5000/health"
 
           for attempt in $(seq 1 12); do
@@ -268,28 +308,30 @@ jobs:
               --fail \
               --silent \
               --show-error \
+              --connect-timeout 3 \
               --max-time 10 \
-              "${HEALTH_URL}" \
-              >/dev/null; then
-              echo "Development backend is healthy"
+              "${HEALTH_URL}"; then
+              echo
+              echo "Production backend is healthy"
               exit 0
             fi
 
+            echo
             echo "Waiting for backend..."
             sleep 5
           done
 
           echo
-          echo "Development backend health check failed"
+          echo "Production backend health check failed"
 
           echo
           echo "PM2 status:"
-          pm2 status form-backend || true
+          pm2 describe form-backend || true
 
           echo
           echo "Recent PM2 logs:"
           pm2 logs form-backend \
-            --lines 100 \
+            --lines 150 \
             --nostream \
             || true
 
@@ -300,10 +342,25 @@ jobs:
             ss -lntp | grep ':5000' || true
           elif command -v netstat >/dev/null 2>&1; then
             netstat -lntp | grep ':5000' || true
+          else
+            echo "Neither ss nor netstat is available"
           fi
 
           exit 1
           EOF
+
+      - name: Verify public backend
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --connect-timeout 5 \
+            --max-time 15 \
+            "http://${BACKEND_HOST}:5000/health"
 
       - name: Prepare frontend directory
         shell: bash
@@ -317,7 +374,7 @@ jobs:
             "${SSH_USER}@${FRONTEND_HOST}" \
             "mkdir -p /var/www/html"
 
-      - name: Deploy frontend
+      - name: Deploy frontend files
         shell: bash
         run: |
           set -euo pipefail
@@ -336,6 +393,8 @@ jobs:
         run: |
           set -euo pipefail
 
+          FRONTEND_URL="http://${FRONTEND_HOST}/"
+
           for attempt in $(seq 1 6); do
             echo "Frontend health-check attempt ${attempt}/6"
 
@@ -344,10 +403,11 @@ jobs:
               --silent \
               --show-error \
               --location \
+              --connect-timeout 5 \
               --max-time 10 \
-              "http://${FRONTEND_HOST}/" \
+              "${FRONTEND_URL}" \
               >/dev/null; then
-              echo "Development frontend is healthy"
+              echo "Production frontend is healthy"
               exit 0
             fi
 
@@ -355,5 +415,14 @@ jobs:
             sleep 5
           done
 
-          echo "Development frontend health check failed"
+          echo "Production frontend health check failed"
+
+          curl \
+            --verbose \
+            --location \
+            --connect-timeout 5 \
+            --max-time 10 \
+            "${FRONTEND_URL}" \
+            || true
+
           exit 1

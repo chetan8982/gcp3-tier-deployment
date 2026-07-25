@@ -9,13 +9,11 @@ async function connectDatabase() {
     console.log(
       `MongoDB connected: ${connection.connection.host}`
     );
-  } catch (error) {
-    console.error(
-      "MongoDB connection failed:",
-      error.message
-    );
 
-    process.exit(1);
+    return connection;
+  } catch (error) {
+    console.error("MongoDB connection failed:", error.message);
+    throw error;
   }
 }
 

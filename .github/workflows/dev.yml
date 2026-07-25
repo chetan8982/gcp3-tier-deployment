@@ -331,7 +331,7 @@ jobs:
             frontend/ \
             "${SSH_USER}@${FRONTEND_HOST}:/var/www/html/"
 
-          - name: Frontend health check
+      - name: Frontend health check
         shell: bash
         run: |
           set -euo pipefail

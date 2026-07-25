@@ -20,6 +20,7 @@ jobs:
 
     defaults:
       run:
+        shell: bash
         working-directory: backend
 
     steps:
@@ -46,34 +47,93 @@ jobs:
     name: Deploy to Development
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     environment:
       name: development
+
+    env:
+      SSH_USER: ${{ secrets.SSH_USER }}
+      BACKEND_HOST: ${{ secrets.BACKEND_HOST }}
+      FRONTEND_HOST: ${{ secrets.FRONTEND_HOST }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Configure SSH
+      - name: Validate deployment secrets
+        shell: bash
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-          BACKEND_HOST: ${{ secrets.BACKEND_HOST }}
-          FRONTEND_HOST: ${{ secrets.FRONTEND_HOST }}
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
         run: |
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
+          set -euo pipefail
 
-          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
+          required_variables=(
+            SSH_USER
+            BACKEND_HOST
+            FRONTEND_HOST
+            SSH_PRIVATE_KEY
+            MONGODB_URI
+          )
 
-          ssh-keyscan -H "$BACKEND_HOST" >> ~/.ssh/known_hosts
-          ssh-keyscan -H "$FRONTEND_HOST" >> ~/.ssh/known_hosts
+          for variable_name in "${required_variables[@]}"; do
+            if [[ -z "${!variable_name:-}" ]]; then
+              echo "::error::Required secret or variable is missing: ${variable_name}"
+              exit 1
+            fi
+          done
+
+      - name: Configure SSH
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "${HOME}/.ssh"
+          chmod 700 "${HOME}/.ssh"
+
+          printf '%s\n' "${SSH_PRIVATE_KEY}" > "${HOME}/.ssh/deploy_key"
+          chmod 600 "${HOME}/.ssh/deploy_key"
+
+          touch "${HOME}/.ssh/known_hosts"
+          chmod 600 "${HOME}/.ssh/known_hosts"
+
+          ssh-keyscan -T 10 -H "${BACKEND_HOST}" \
+            >> "${HOME}/.ssh/known_hosts"
+
+          if [[ "${FRONTEND_HOST}" != "${BACKEND_HOST}" ]]; then
+            ssh-keyscan -T 10 -H "${FRONTEND_HOST}" \
+              >> "${HOME}/.ssh/known_hosts"
+          fi
+
+      - name: Verify SSH connections
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh \
+            -i "${HOME}/.ssh/deploy_key" \
+            -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            "${SSH_USER}@${BACKEND_HOST}" \
+            "echo 'Backend SSH connection successful'"
+
+          ssh \
+            -i "${HOME}/.ssh/deploy_key" \
+            -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            "${SSH_USER}@${FRONTEND_HOST}" \
+            "echo 'Frontend SSH connection successful'"
 
       - name: Create backend environment file
+        shell: bash
         env:
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
-          FRONTEND_HOST: ${{ secrets.FRONTEND_HOST }}
         run: |
+          set -euo pipefail
+
           cat > backend/.env <<EOF
           NODE_ENV=development
           PORT=5000
@@ -81,81 +141,200 @@ jobs:
           ALLOWED_ORIGINS=http://${FRONTEND_HOST}
           EOF
 
+          chmod 600 backend/.env
+
       - name: Configure frontend API URL
-        env:
-          BACKEND_HOST: ${{ secrets.BACKEND_HOST }}
+        shell: bash
         run: |
+          set -euo pipefail
+
+          API_URL="http://${BACKEND_HOST}:5000/api/forms"
+
+          if ! grep -qE '^[[:space:]]*const API_URL[[:space:]]*=' \
+            frontend/script.js; then
+            echo "::error::Could not find 'const API_URL =' in frontend/script.js"
+            exit 1
+          fi
+
           sed -i \
-            "s|const API_URL = .*|const API_URL = \"http://${BACKEND_HOST}:5000/api/forms\";|" \
+            "s|^[[:space:]]*const API_URL[[:space:]]*=.*|const API_URL = \"${API_URL}\";|" \
             frontend/script.js
 
-      - name: Deploy backend
-        env:
-          SSH_USER: ${{ secrets.SSH_USER }}
-          BACKEND_HOST: ${{ secrets.BACKEND_HOST }}
+          grep 'const API_URL' frontend/script.js
+
+      - name: Prepare backend directory
+        shell: bash
         run: |
+          set -euo pipefail
+
+          ssh \
+            -i "${HOME}/.ssh/deploy_key" \
+            -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            "${SSH_USER}@${BACKEND_HOST}" \
+            "mkdir -p /opt/form-backend"
+
+      - name: Deploy backend
+        shell: bash
+        run: |
+          set -euo pipefail
+
           rsync -az \
             --delete \
-            --exclude node_modules \
-            --exclude .git \
-            -e "ssh -i ~/.ssh/deploy_key" \
+            --exclude='node_modules/' \
+            --exclude='.git/' \
+            -e "ssh -i ${HOME}/.ssh/deploy_key -o BatchMode=yes -o ConnectTimeout=10" \
             backend/ \
             "${SSH_USER}@${BACKEND_HOST}:/opt/form-backend/"
 
-      - name: Restart backend
-        env:
-          SSH_USER: ${{ secrets.SSH_USER }}
-          BACKEND_HOST: ${{ secrets.BACKEND_HOST }}
+      - name: Install and restart backend
+        shell: bash
         run: |
-          ssh -i ~/.ssh/deploy_key \
-            "${SSH_USER}@${BACKEND_HOST}" <<'EOF'
-              set -e
-              cd /opt/form-backend
+          set -euo pipefail
 
-              npm ci --omit=dev
+          ssh \
+            -i "${HOME}/.ssh/deploy_key" \
+            -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            "${SSH_USER}@${BACKEND_HOST}" \
+            'bash -se' <<'EOF'
+          set -euo pipefail
 
-              if pm2 describe form-backend >/dev/null 2>&1; then
-                pm2 restart form-backend --update-env
-              else
-                pm2 start server.js --name form-backend
-              fi
+          cd /opt/form-backend
 
-              pm2 save
+          if ! command -v node >/dev/null 2>&1; then
+            echo "Node.js is not installed on the backend server"
+            exit 1
+          fi
+
+          if ! command -v npm >/dev/null 2>&1; then
+            echo "npm is not installed on the backend server"
+            exit 1
+          fi
+
+          if ! command -v pm2 >/dev/null 2>&1; then
+            echo "PM2 is not installed on the backend server"
+            echo "Install it with: sudo npm install --global pm2"
+            exit 1
+          fi
+
+          npm ci --omit=dev
+
+          if pm2 describe form-backend >/dev/null 2>&1; then
+            pm2 restart form-backend --update-env
+          else
+            pm2 start server.js \
+              --name form-backend \
+              --time
+          fi
+
+          pm2 save
+          pm2 status form-backend
           EOF
 
-      - name: Deploy frontend
-        env:
-          SSH_USER: ${{ secrets.SSH_USER }}
-          FRONTEND_HOST: ${{ secrets.FRONTEND_HOST }}
-        run: |
-          rsync -az \
-            --delete \
-            --exclude .git \
-            -e "ssh -i ~/.ssh/deploy_key" \
-            frontend/ \
-            "${SSH_USER}@${FRONTEND_HOST}:/var/www/html/"
-
       - name: Backend health check
-        env:
-          BACKEND_HOST: ${{ secrets.BACKEND_HOST }}
+        shell: bash
         run: |
-          for attempt in {1..10}; do
-            if curl --fail --silent \
-              "http://${BACKEND_HOST}:5000/" >/dev/null; then
+          set -euo pipefail
+
+          ssh \
+            -i "${HOME}/.ssh/deploy_key" \
+            -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            "${SSH_USER}@${BACKEND_HOST}" \
+            'bash -se' <<'EOF'
+          set -u
+
+          HEALTH_URL="http://127.0.0.1:5000/api/forms"
+
+          for attempt in {1..12}; do
+            echo "Backend health-check attempt ${attempt}/12"
+
+            if curl \
+              --fail \
+              --silent \
+              --show-error \
+              --max-time 10 \
+              "${HEALTH_URL}" \
+              >/dev/null; then
               echo "Development backend is healthy"
               exit 0
             fi
 
-            echo "Waiting for backend..."
             sleep 5
           done
 
           echo "Development backend health check failed"
+          echo
+          echo "PM2 status:"
+          pm2 status form-backend || true
+
+          echo
+          echo "Recent backend logs:"
+          pm2 logs form-backend \
+            --lines 100 \
+            --nostream \
+            || true
+
+          echo
+          echo "Listening processes on port 5000:"
+          if command -v ss >/dev/null 2>&1; then
+            ss -lntp | grep ':5000' || true
+          elif command -v netstat >/dev/null 2>&1; then
+            netstat -lntp | grep ':5000' || true
+          fi
+
           exit 1
+          EOF
+
+      - name: Prepare frontend directory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh \
+            -i "${HOME}/.ssh/deploy_key" \
+            -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            "${SSH_USER}@${FRONTEND_HOST}" \
+            "mkdir -p /var/www/html"
+
+      - name: Deploy frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rsync -az \
+            --delete \
+            --exclude='.git/' \
+            -e "ssh -i ${HOME}/.ssh/deploy_key -o BatchMode=yes -o ConnectTimeout=10" \
+            frontend/ \
+            "${SSH_USER}@${FRONTEND_HOST}:/var/www/html/"
 
       - name: Frontend health check
-        env:
-          FRONTEND_HOST: ${{ secrets.FRONTEND_HOST }}
+        shell: bash
         run: |
-          curl --fail --silent "http://${FRONTEND_HOST}/" >/dev/null
-          echo "Development frontend is healthy"
+          set -euo pipefail
+
+          FRONTEND_URL="http://${FRONTEND_HOST}/"
+
+          for attempt in {1..6}; do
+            echo "Frontend health-check attempt ${attempt}/6"
+
+            if curl \
+              --fail \
+              --silent \
+              --show-error \
+              --location \
+              --max-time 10 \
+              "${FRONTEND_URL}" \
+              >/dev/null; then
+              echo "Development frontend is healthy"
+              exit 0
+            fi
+
+            sleep 5
+          done
+
+          echo "Development frontend health check failed"
+          exit 1

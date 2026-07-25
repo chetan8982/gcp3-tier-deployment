@@ -3,7 +3,7 @@ name: Deploy Production
 on:
   push:
     branches:
-      - main
+      - dev
   workflow_dispatch:
 
 permissions:
@@ -84,6 +84,8 @@ jobs:
             fi
           done
 
+          echo "All required secrets are configured"
+
       - name: Configure SSH
         shell: bash
         env:
@@ -145,12 +147,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          cat > backend/.env <<EOF
-          NODE_ENV=production
-          PORT=5000
-          MONGODB_URI=${MONGODB_URI}
-          ALLOWED_ORIGINS=http://${FRONTEND_HOST}
-          EOF
+          {
+            echo "NODE_ENV=production"
+            echo "PORT=5000"
+            printf 'MONGODB_URI=%s\n' "${MONGODB_URI}"
+            printf 'ALLOWED_ORIGINS=http://%s\n' "${FRONTEND_HOST}"
+          } > backend/.env
 
           chmod 600 backend/.env
 
@@ -220,33 +222,68 @@ jobs:
           cd /opt/form-backend
 
           if ! command -v node >/dev/null 2>&1; then
-            echo "Node.js is not installed on the backend server"
+            echo "Node.js is not installed"
             exit 1
           fi
 
           if ! command -v npm >/dev/null 2>&1; then
-            echo "npm is not installed on the backend server"
+            echo "npm is not installed"
             exit 1
           fi
 
           if ! command -v pm2 >/dev/null 2>&1; then
-            echo "PM2 is not installed on the backend server"
-            echo "Install it with: sudo npm install --global pm2"
+            echo "PM2 is not installed"
+            echo "Install with: sudo npm install --global pm2"
             exit 1
           fi
 
-          npm ci --omit=dev
-
-          if pm2 describe form-backend >/dev/null 2>&1; then
-            pm2 restart form-backend --update-env
-          else
-            pm2 start server.js \
-              --name form-backend \
-              --time
+          if [[ ! -f package.json ]]; then
+            echo "package.json not found"
+            exit 1
           fi
 
+          if [[ ! -f server.js ]]; then
+            echo "server.js not found"
+            exit 1
+          fi
+
+          if [[ ! -f .env ]]; then
+            echo ".env file not found"
+            exit 1
+          fi
+
+          echo "Node version:"
+          node --version
+
+          echo "npm version:"
+          npm --version
+
+          echo "Installing production dependencies..."
+          npm ci --omit=dev
+
+          echo "Checking backend syntax..."
+          node --check server.js
+
+          echo "Restarting backend..."
+          pm2 delete form-backend >/dev/null 2>&1 || true
+
+          pm2 start server.js \
+            --name form-backend \
+            --cwd /opt/form-backend \
+            --time
+
+          sleep 5
+
+          echo "PM2 status:"
+          pm2 describe form-backend || true
+
+          echo "PM2 logs:"
+          pm2 logs form-backend \
+            --lines 100 \
+            --nostream \
+            || true
+
           pm2 save
-          pm2 status form-backend
           EOF
 
       - name: Backend health check
@@ -264,20 +301,22 @@ jobs:
 
           HEALTH_URL="http://127.0.0.1:5000/health"
 
-          for attempt in {1..12}; do
+          for attempt in $(seq 1 12); do
             echo "Backend health-check attempt ${attempt}/12"
 
             if curl \
               --fail \
               --silent \
               --show-error \
+              --connect-timeout 3 \
               --max-time 10 \
-              "${HEALTH_URL}" \
-              >/dev/null; then
+              "${HEALTH_URL}"; then
+              echo
               echo "Production backend is healthy"
               exit 0
             fi
 
+            echo
             echo "Waiting for backend..."
             sleep 5
           done
@@ -287,12 +326,12 @@ jobs:
 
           echo
           echo "PM2 status:"
-          pm2 status form-backend || true
+          pm2 describe form-backend || true
 
           echo
           echo "Recent PM2 logs:"
           pm2 logs form-backend \
-            --lines 100 \
+            --lines 150 \
             --nostream \
             || true
 
@@ -309,6 +348,19 @@ jobs:
 
           exit 1
           EOF
+
+      - name: Verify public backend
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --connect-timeout 5 \
+            --max-time 15 \
+            "http://${BACKEND_HOST}:5000/health"
 
       - name: Prepare frontend directory
         shell: bash
@@ -343,7 +395,7 @@ jobs:
 
           FRONTEND_URL="http://${FRONTEND_HOST}/"
 
-          for attempt in {1..6}; do
+          for attempt in $(seq 1 6); do
             echo "Frontend health-check attempt ${attempt}/6"
 
             if curl \
@@ -351,6 +403,7 @@ jobs:
               --silent \
               --show-error \
               --location \
+              --connect-timeout 5 \
               --max-time 10 \
               "${FRONTEND_URL}" \
               >/dev/null; then
@@ -363,4 +416,13 @@ jobs:
           done
 
           echo "Production frontend health check failed"
+
+          curl \
+            --verbose \
+            --location \
+            --connect-timeout 5 \
+            --max-time 10 \
+            "${FRONTEND_URL}" \
+            || true
+
           exit 1
